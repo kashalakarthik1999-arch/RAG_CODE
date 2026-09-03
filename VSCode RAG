@@ -1,1 +1,37 @@
+Step 1: Open Your Folder in VS CodeClick on File -> Open Folder... in the top-left menu bar of VS Code.Navigate to your project location path: /home/labuser/Documents/RAG and click OK.
+Step 2: Open an Integrated Terminal inside VS CodeOpen a terminal directly inside your workspace window by pressing `Ctrl + `` (or clicking Terminal -> New Terminal from the top options bar).
+Since your VM environment uses Conda out of the box (indicated by that (base) marker), initialize your isolated workspace sandbox directly by running this sequential block in your new terminal window:
 
+# 1. Create your isolated environment block named 'rag_env' with Python 3.10
+conda create -n rag_env python=3.10 -y
+
+# 2. Step into your newly built isolated environment sandbox space
+conda activate rag_env
+
+# 3. Securely download the parsing and evaluation frameworks needed by your code
+pip install --upgrade pip
+pip install docling langchain-text-splitters rank_bm25 sentence-transformers faiss-cpu ollama pandas tqdm ragas langchain-community python-dotenv
+
+
+Step 3: Map Your Jupyter Kernel to rag_envDouble-click on your claim.ipynb file in the left-hand File Explorer panel to open it.
+Look at the top-right corner of your open notebook editor window and click the Select Kernel button.
+Choose Python Environments... from the dropdown menu, and select your newly built rag_env environment line core.
+
+Step 4: Run the Standalone Local Ollama Server CoreTo allow your notebook to make free, 
+unlimited claims inference queries to your local model brain, paste these user-space standalone installation commands into your active VS Code terminal 
+prompt to execute the server loop:
+
+
+# 1. Fetch the portable Linux system compiler execution worker
+curl -L https://ollama.com -o ollama
+chmod +x ollama
+
+# 2. Spin up the Ollama background service processor 
+./ollama serve &
+
+# 3. Pull down the lightweight Llama 3.2 model parameters file 
+./ollama run llama3.2
+
+Step 5: Execute Your Cells!You are officially completely configured inside your VM sandbox. 
+Scroll down to your 50 Golden Curated Questions validation block, hit the Run All Cells button (or click the play button next to each block step), 
+and watch your local Llama core generate your evaluation metrics matrix dashboard completely for free on your VM chip server!
