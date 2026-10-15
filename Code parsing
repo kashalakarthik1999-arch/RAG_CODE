@@ -1,1 +1,570 @@
 
+import re
+import json
+from pathlib import Path
+from datetime import datetime
+
+import fitz  # PyMuPDF
+import pandas as pd
+
+
+# ============================================================
+# 1. CONFIGURATION: CHANGE THIS PATH TO YOUR PDF
+# ============================================================
+
+PDF_PATH = Path(r"C:\HVACi\Input\assessment_report.pdf")
+
+OUTPUT_DIR = Path(r"C:\HVACi\Output")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+EXCEL_PATH = OUTPUT_DIR / "hvaci_extraction.xlsx"
+TEXT_PATH = OUTPUT_DIR / "extracted_pdf_text.txt"
+
+# A page with less text than this may be scanned.
+OCR_TEXT_THRESHOLD = 40
+
+
+# ============================================================
+# 2. HELPER FUNCTIONS
+# ============================================================
+
+def clean_text(text):
+    """Clean unnecessary whitespace from extracted text."""
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def first_match(pattern, text, flags=re.IGNORECASE | re.MULTILINE):
+    """Return the first regex capture group, if found."""
+    match = re.search(pattern, text, flags)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def parse_money(value):
+    """Convert a monetary string into a numeric amount."""
+    if not value:
+        return None
+
+    cleaned = value.replace("$", "").replace(",", "").strip()
+
+    try:
+        return round(float(cleaned), 2)
+    except (ValueError, TypeError):
+        return None
+
+
+def find_amount_near_label(labels, text):
+    """
+    Find a monetary amount appearing after a specified label.
+
+    The patterns are starting points. Adjust the labels if your
+    report uses different wording.
+    """
+    for label in labels:
+        pattern = (
+            label
+            + r"\s*:?\s*(?:USD\s*)?"
+            + r"\$?\s*"
+            + r"(\d[\d,]*\.\d{2})"
+        )
+
+        match = re.search(pattern, text, re.IGNORECASE)
+
+        if match:
+            return parse_money(match.group(1))
+
+    return None
+
+
+# ============================================================
+# 3. READ PDF AND USE OCR WHEN NECESSARY
+# ============================================================
+
+def read_pdf(pdf_path):
+    """Extract text from every page, attempting OCR when needed."""
+    page_records = []
+    all_text = []
+    warnings = []
+
+    if not pdf_path.exists():
+        raise FileNotFoundError(
+            f"PDF not found: {pdf_path}\n"
+            "Update PDF_PATH at the top of this script."
+        )
+
+    with fitz.open(pdf_path) as document:
+        total_pages = len(document)
+
+        for page_number, page in enumerate(document, start=1):
+            text = page.get_text("text", sort=True)
+            method = "Text extraction"
+
+            # OCR fallback for pages with very little extractable text.
+            if len(text.strip()) < OCR_TEXT_THRESHOLD:
+                try:
+                    text_page = page.get_textpage_ocr(
+                        language="eng",
+                        dpi=200,
+                        full=True
+                    )
+
+                    ocr_text = page.get_text(
+                        "text",
+                        textpage=text_page,
+                        sort=True
+                    )
+
+                    if len(ocr_text.strip()) > len(text.strip()):
+                        text = ocr_text
+                        method = "OCR"
+
+                except Exception as error:
+                    warnings.append(
+                        f"Page {page_number}: OCR was unsuccessful: "
+                        f"{error}"
+                    )
+
+            text = clean_text(text)
+
+            if not text:
+                warnings.append(
+                    f"Page {page_number}: no text was extracted."
+                )
+
+            page_records.append({
+                "page_number": page_number,
+                "extraction_method": method,
+                "character_count": len(text),
+                "page_text": text
+            })
+
+            all_text.append(
+                f"\n--- PAGE {page_number} ---\n{text}"
+            )
+
+    return total_pages, page_records, "\n".join(all_text), warnings
+
+
+# ============================================================
+# 4. EXTRACT CLAIM AND REPORT INFORMATION
+# ============================================================
+
+def extract_claim_summary(pdf_path, total_pages, text, page_records):
+    """Extract important report-level fields."""
+
+    claim_number = first_match(
+        r"\bClaim\s*(?:Number|No\.?|#)\s*:?\s*"
+        r"([A-Z0-9-]+)",
+        text
+    )
+
+    hvaci_file_number = first_match(
+        r"\bHVACi\s*(?:File\s*)?(?:Number|No\.?|#)\s*:?\s*"
+        r"([A-Z0-9-]+)",
+        text
+    )
+
+    report_date = first_match(
+        r"\bReport\s*Date\s*:?\s*"
+        r"(\d{1,2}[/-]\d{1,2}[/-]\d{4})",
+        text
+    )
+
+    equipment_model = first_match(
+        r"\b(?:Equipment\s*Model|Model\s*Number|"
+        r"Model\s*No\.?|Model\s*#)\s*:?\s*"
+        r"([A-Z0-9][A-Z0-9-]{3,})",
+        text
+    )
+
+    model_year = first_match(
+        r"\b(?:Approx(?:imate)?\.?\s*)?"
+        r"(?:Model\s*)?Year\s*:?\s*((?:19|20)\d{2})",
+        text
+    )
+
+    cause_of_loss = first_match(
+        r"\bCause\s*of\s*Loss\s*:?\s*([^\n]+)",
+        text
+    )
+
+    repair_recommendation = first_match(
+        r"\b(?:Repair\s*Recommendation|"
+        r"Recommended\s*Repair|Recommendation)\s*:?\s*"
+        r"([^\n]+)",
+        text
+    )
+
+    total_repair_cost = find_amount_near_label(
+        [
+            r"Total\s*Recommended\s*Repair\s*Cost",
+            r"Recommended\s*Repair\s*Cost",
+            r"Total\s*Repair\s*Cost"
+        ],
+        text
+    )
+
+    depreciation = find_amount_near_label(
+        [
+            r"Total\s*Depreciation",
+            r"Depreciation"
+        ],
+        text
+    )
+
+    recommended_acv = find_amount_near_label(
+        [
+            r"Recommended\s*ACV",
+            r"Actual\s*Cash\s*Value",
+            r"\bACV\b"
+        ],
+        text
+    )
+
+    extraction_methods = sorted({
+        record["extraction_method"]
+        for record in page_records
+    })
+
+    return {
+        "source_pdf": pdf_path.name,
+        "total_pages": total_pages,
+        "claim_number": claim_number,
+        "hvaci_file_number": hvaci_file_number,
+        "report_date": report_date,
+        "equipment_model": equipment_model,
+        "model_year": model_year,
+        "cause_of_loss": cause_of_loss,
+        "repair_recommendation": repair_recommendation,
+        "total_recommended_repair_cost": total_repair_cost,
+        "depreciation": depreciation,
+        "recommended_acv": recommended_acv,
+        "extraction_methods": ", ".join(extraction_methods)
+    }
+
+
+# ============================================================
+# 5. EXTRACT REPAIR COMPONENT EVIDENCE
+# ============================================================
+
+def extract_repair_items(text, source_pdf):
+    """
+    Find repair-component mentions and their surrounding text.
+
+    The nearby text is retained as evidence. Amounts found nearby
+    are not automatically assigned to parts, labor, or totals,
+    because PDF table layouts can change the reading order.
+    """
+
+    components = [
+        "circuit board",
+        "control board",
+        "transformer",
+        "compressor",
+        "condenser",
+        "evaporator",
+        "thermostat",
+        "fan motor",
+        "blower motor",
+        "capacitor",
+        "contactor",
+        "startup labor"
+    ]
+
+    rows = []
+    seen = set()
+
+    for component in components:
+        pattern = re.compile(
+            re.escape(component),
+            re.IGNORECASE
+        )
+
+        for match in pattern.finditer(text):
+            start = max(0, match.start() - 150)
+            end = min(len(text), match.end() + 250)
+            context = text[start:end].replace("\n", " ")
+            context = re.sub(r"\s+", " ", context).strip()
+
+            # Avoid duplicate rows for the same occurrence.
+            key = (component.lower(), match.start())
+            if key in seen:
+                continue
+            seen.add(key)
+
+            part_number = first_match(
+                r"\b(?:Part\s*(?:Number|No\.?|#))\s*:?\s*"
+                r"([A-Z0-9-]+)",
+                context
+            )
+
+            amounts = re.findall(
+                r"\$\s*(\d[\d,]*\.\d{2})",
+                context
+            )
+
+            rows.append({
+                "source_pdf": source_pdf,
+                "component_mentioned": component.title(),
+                "part_number": part_number,
+                "amounts_in_nearby_text": ", ".join(
+                    f"${amount}" for amount in amounts
+                ),
+                "page_or_section_evidence": context
+            })
+
+    if not rows:
+        rows.append({
+            "source_pdf": source_pdf,
+            "component_mentioned": None,
+            "part_number": None,
+            "amounts_in_nearby_text": None,
+            "page_or_section_evidence":
+                "No configured repair-component keywords were found."
+        })
+
+    return rows
+
+
+# ============================================================
+# 6. VALIDATE EXTRACTED INFORMATION
+# ============================================================
+
+def create_qa_log(summary, page_records, warnings):
+    """Create a list of checks and warnings for review."""
+    qa_rows = []
+
+    def add_check(check, status, details):
+        qa_rows.append({
+            "check": check,
+            "status": status,
+            "details": details
+        })
+
+    # Check important fields.
+    required_fields = [
+        "claim_number",
+        "hvaci_file_number",
+        "report_date",
+        "total_recommended_repair_cost",
+        "recommended_acv"
+    ]
+
+    for field in required_fields:
+        value = summary.get(field)
+
+        add_check(
+            f"Field present: {field}",
+            "PASS" if value is not None else "REVIEW",
+            str(value) if value is not None
+            else "Field not found. Check the PDF and update the pattern."
+        )
+
+    # Check financial arithmetic if all values were found.
+    repair_cost = summary["total_recommended_repair_cost"]
+    depreciation = summary["depreciation"]
+    acv = summary["recommended_acv"]
+
+    if (
+        repair_cost is not None
+        and depreciation is not None
+        and acv is not None
+    ):
+        calculated_acv = round(repair_cost - depreciation, 2)
+        difference = round(calculated_acv - acv, 2)
+
+        add_check(
+            "Repair cost minus depreciation equals ACV",
+            "PASS" if abs(difference) <= 0.02 else "REVIEW",
+            f"Calculated ACV=${calculated_acv:.2f}; "
+            f"extracted ACV=${acv:.2f}; "
+            f"difference=${difference:.2f}"
+        )
+    else:
+        add_check(
+            "Repair cost minus depreciation equals ACV",
+            "REVIEW",
+            "One or more financial fields were not extracted."
+        )
+
+    # Check whether each page has readable text.
+    for record in page_records:
+        status = (
+            "PASS" if record["character_count"] > 0 else "REVIEW"
+        )
+
+        add_check(
+            f"Page {record['page_number']} text extraction",
+            status,
+            f"Method={record['extraction_method']}; "
+            f"characters={record['character_count']}"
+        )
+
+    for warning in warnings:
+        add_check("Processing warning", "REVIEW", warning)
+
+    return qa_rows
+
+
+# ============================================================
+# 7. EXPORT TO EXCEL
+# ============================================================
+
+def export_to_excel(summary, page_records, repair_rows, qa_rows):
+    """Write the extracted data into a formatted Excel workbook."""
+
+    summary_df = pd.DataFrame([summary])
+
+    repair_df = pd.DataFrame(repair_rows)
+
+    pages_df = pd.DataFrame([
+        {
+            "page_number": record["page_number"],
+            "extraction_method": record["extraction_method"],
+            "character_count": record["character_count"],
+            "page_text": record["page_text"]
+        }
+        for record in page_records
+    ])
+
+    qa_df = pd.DataFrame(qa_rows)
+
+    with pd.ExcelWriter(
+        EXCEL_PATH,
+        engine="openpyxl"
+    ) as writer:
+
+        summary_df.to_excel(
+            writer,
+            sheet_name="Claim_Summary",
+            index=False
+        )
+
+        repair_df.to_excel(
+            writer,
+            sheet_name="Repair_Items",
+            index=False
+        )
+
+        pages_df.to_excel(
+            writer,
+            sheet_name="Extracted_Text",
+            index=False
+        )
+
+        qa_df.to_excel(
+            writer,
+            sheet_name="QA_Log",
+            index=False
+        )
+
+        # Basic formatting for each worksheet.
+        for worksheet in writer.book.worksheets:
+            worksheet.freeze_panes = "A2"
+            worksheet.auto_filter.ref = worksheet.dimensions
+
+            for column_cells in worksheet.columns:
+                column_letter = column_cells[0].column_letter
+                header = str(column_cells[0].value or "")
+
+                if header in [
+                    "page_text",
+                    "page_or_section_evidence",
+                    "details"
+                ]:
+                    worksheet.column_dimensions[
+                        column_letter
+                    ].width = 65
+                else:
+                    worksheet.column_dimensions[
+                        column_letter
+                    ].width = min(
+                        max(
+                            max(
+                                len(str(cell.value or ""))
+                                for cell in column_cells
+                            ) + 2,
+                            14
+                        ),
+                        35
+                    )
+
+                for cell in column_cells:
+                    if cell.row > 1 and header in [
+                        "page_text",
+                        "page_or_section_evidence",
+                        "details"
+                    ]:
+                        cell.alignment = cell.alignment.copy(
+                            wrap_text=True,
+                            vertical="top"
+                        )
+
+    print(f"Excel workbook saved: {EXCEL_PATH}")
+
+
+# ============================================================
+# 8. MAIN PROGRAM
+# ============================================================
+
+def main():
+    print("Starting HVACi PDF extraction...")
+    print(f"Input PDF: {PDF_PATH}")
+
+    total_pages, page_records, text, warnings = read_pdf(
+        PDF_PATH
+    )
+
+    # Save the full extracted text for troubleshooting.
+    TEXT_PATH.write_text(text, encoding="utf-8")
+
+    print(f"Pages processed: {total_pages}")
+    print(f"Extracted text saved: {TEXT_PATH}")
+
+    summary = extract_claim_summary(
+        PDF_PATH,
+        total_pages,
+        text,
+        page_records
+    )
+
+    repair_rows = extract_repair_items(
+        text,
+        PDF_PATH.name
+    )
+
+    qa_rows = create_qa_log(
+        summary,
+        page_records,
+        warnings
+    )
+
+    export_to_excel(
+        summary,
+        page_records,
+        repair_rows,
+        qa_rows
+    )
+
+    print("\nExtraction completed.")
+    print(f"Review the Excel workbook: {EXCEL_PATH}")
+    print("Check the QA_Log and Extracted_Text sheets.")
+
+    # Save a JSON copy of the summary for troubleshooting.
+    json_path = OUTPUT_DIR / "summary.json"
+
+    json_path.write_text(
+        json.dumps(summary, indent=2, default=str),
+        encoding="utf-8"
+    )
+
+    print(f"Summary JSON saved: {json_path}")
+
+
+if __name__ == "__main__":
+    main()
+
